@@ -75,13 +75,67 @@ export class BaseRepository {
    * @returns {Promise<Array>} 记录数组
    */
   async findMany(table, conditions = {}, options = {}) {
+    // 过滤条件既支持等值（{ field: value }），也支持操作符对象
+    // （{ field: { "!=": 1 } } / { ">=": 3 } / { in: [..] } / { is: null }）。
+    // 之前只按等值拼接 SQL，操作符对象会被整体当作绑定参数，D1 会直接报
+    // D1_TYPE_ERROR: Type 'object' not supported。
+    const buildCondition = (field, value) => {
+      const operators = {
+        '!=': '!=',
+        '>': '>',
+        '<': '<',
+        '>=': '>=',
+        '<=': '<=',
+        'like': 'LIKE',
+        'not like': 'NOT LIKE',
+      };
+
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+        const keys = Object.keys(value);
+        if (keys.length !== 1) {
+          throw new ValidationError(`过滤条件 ${field} 只能包含一个操作符`);
+        }
+        const operator = keys[0];
+        const raw = value[operator];
+
+        if (operator === 'in') {
+          if (!Array.isArray(raw) || raw.length === 0) {
+            // 空集合等价于不命中任何行
+            return { clause: '1 = 0', values: [] };
+          }
+          return {
+            clause: `${field} IN (${raw.map(() => '?').join(', ')})`,
+            values: [...raw],
+          };
+        }
+        if (operator === 'is' || operator === 'is not') {
+          if (raw !== null) {
+            throw new ValidationError(`过滤条件 ${field} 的 ${operator} 只支持 null`);
+          }
+          return { clause: `${field} ${operator.toUpperCase()} NULL`, values: [] };
+        }
+        const sqlOperator = operators[operator];
+        if (!sqlOperator) {
+          throw new ValidationError(`不支持的过滤操作符: ${operator}`);
+        }
+        return { clause: `${field} ${sqlOperator} ?`, values: [raw] };
+      }
+
+      if (value === null) {
+        return { clause: `${field} IS NULL`, values: [] };
+      }
+
+      return { clause: `${field} = ?`, values: [value] };
+    };
+
     const fields = Object.keys(conditions);
-    const values = Object.values(conditions);
-    
+    const built = fields.map((field) => buildCondition(field, conditions[field]));
+    const values = built.flatMap((item) => item.values);
+
     let sql = `SELECT * FROM ${table}`;
-    
-    if (fields.length > 0) {
-      const whereClause = fields.map(field => `${field} = ?`).join(' AND ');
+
+    if (built.length > 0) {
+      const whereClause = built.map((item) => item.clause).join(' AND ');
       sql += ` WHERE ${whereClause}`;
     }
     
